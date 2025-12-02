@@ -1,0 +1,25 @@
+version: "3.8"
+
+services:
+  gateway:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - LINE_CHANNEL_ACCESS_TOKEN=${LINE_CHANNEL_ACCESS_TOKEN}
+      - LINE_CHANNEL_SECRET=${LINE_CHANNEL_SECRET}
+      - OLD_SYSTEM_WEBHOOK_URL=${OLD_SYSTEM_WEBHOOK_URL}
+      - NEW_SYSTEM_WEBHOOK_URL=${NEW_SYSTEM_WEBHOOK_URL}
+      - REPLY_MODE=${REPLY_MODE:-unified}
+      - OLD_SYSTEM_KEYWORDS=${OLD_SYSTEM_KEYWORDS:-開發票,地址,預約,轉帳,繳費}
+      - DATABASE_TYPE=${DATABASE_TYPE:-sqlite}
+      - DATABASE_URL=${DATABASE_URL:-sqlite:///./data/conversations.db}
+    volumes:
+      # 持久化資料庫
+      - ./data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
