@@ -766,7 +766,331 @@ class IntentRouter:
 
 ---
 
+## 階段七：AI 自我進化系統（未來規劃）
+
+### 目標
+
+讓 AI 從人工修改中學習，逐漸提升草稿品質，減少人工修改次數。
+
+### 進化架構
+
+```
+生成草稿
+     ↓
+人工回饋（並行收集）
+├── 快速回饋：👍 / 👎
+├── 評分：1-5 星
+└── 修改原因：文字描述
+     ↓
+累積數據
+     ↓
+定期分析 → 更新 Prompt / 規則
+     ↓
+AI 生成更好的草稿
+```
+
+### 資料庫模型修改
+
+**檔案位置**: `brain/backend/db/models.py`
+
+在 `Draft` 模型新增欄位：
+
+```python
+class Draft(Base):
+    """AI 草稿"""
+    __tablename__ = "drafts"
+
+    # ... 原有欄位 ...
+
+    # 人工評分回饋
+    is_good = Column(Boolean, nullable=True)          # 快速回饋：好/不好
+    rating = Column(Integer, nullable=True)           # 評分：1-5 星
+    feedback_reason = Column(Text, nullable=True)     # 人工填寫的修改/不好原因
+    feedback_at = Column(DateTime, nullable=True)     # 回饋時間
+
+    # AI 分析結果（自動填入）
+    auto_analysis = Column(Text, nullable=True)       # AI 分析的修改原因
+    improvement_tags = Column(JSON, nullable=True)    # 改進標籤 ["語氣", "專業度", "完整性"]
+```
+
+### API 端點
+
+**檔案位置**: `brain/backend/api/routes/messages.py`
+
+```python
+from pydantic import BaseModel
+from typing import Optional
+
+class DraftFeedback(BaseModel):
+    is_good: Optional[bool] = None      # 快速回饋
+    rating: Optional[int] = None        # 1-5 星
+    feedback_reason: Optional[str] = None  # 修改原因
+
+@router.post("/drafts/{draft_id}/feedback")
+async def submit_draft_feedback(
+    draft_id: int,
+    feedback: DraftFeedback,
+    db: AsyncSession = Depends(get_db)
+):
+    """提交草稿回饋"""
+    draft = await db.get(Draft, draft_id)
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found")
+
+    # 更新回饋
+    if feedback.is_good is not None:
+        draft.is_good = feedback.is_good
+    if feedback.rating is not None:
+        draft.rating = max(1, min(5, feedback.rating))  # 限制 1-5
+    if feedback.feedback_reason:
+        draft.feedback_reason = feedback.feedback_reason
+
+    draft.feedback_at = datetime.utcnow()
+    await db.commit()
+
+    return {"success": True, "message": "回饋已記錄"}
+
+@router.get("/stats/feedback-summary")
+async def get_feedback_summary(
+    days: int = 30,
+    db: AsyncSession = Depends(get_db)
+):
+    """取得回饋統計摘要"""
+    start = datetime.utcnow() - timedelta(days=days)
+
+    # 統計好/不好比例
+    result = await db.execute(
+        select(
+            func.count(Draft.id).label("total"),
+            func.sum(case((Draft.is_good == True, 1), else_=0)).label("good_count"),
+            func.sum(case((Draft.is_good == False, 1), else_=0)).label("bad_count"),
+            func.avg(Draft.rating).label("avg_rating")
+        ).where(
+            Draft.feedback_at >= start,
+            Draft.is_good.isnot(None)
+        )
+    )
+    row = result.first()
+
+    return {
+        "period_days": days,
+        "total_feedback": row.total or 0,
+        "good_count": row.good_count or 0,
+        "bad_count": row.bad_count or 0,
+        "good_rate": round((row.good_count or 0) / max(row.total or 1, 1) * 100, 1),
+        "avg_rating": round(row.avg_rating or 0, 2)
+    }
+```
+
+### 前端 UI 設計
+
+在草稿顯示區域新增回饋元件：
+
+```jsx
+// DraftFeedback.jsx
+function DraftFeedback({ draftId, onFeedbackSubmit }) {
+  const [isGood, setIsGood] = useState(null);
+  const [rating, setRating] = useState(0);
+  const [reason, setReason] = useState('');
+
+  const handleSubmit = async () => {
+    await api.post(`/drafts/${draftId}/feedback`, {
+      is_good: isGood,
+      rating: rating || null,
+      feedback_reason: reason || null
+    });
+    onFeedbackSubmit();
+  };
+
+  return (
+    <div className="draft-feedback">
+      {/* 快速回饋 */}
+      <div className="quick-feedback">
+        <button
+          className={isGood === true ? 'selected' : ''}
+          onClick={() => setIsGood(true)}
+        >
+          👍 好
+        </button>
+        <button
+          className={isGood === false ? 'selected' : ''}
+          onClick={() => setIsGood(false)}
+        >
+          👎 不好
+        </button>
+      </div>
+
+      {/* 星級評分 */}
+      <div className="star-rating">
+        {[1, 2, 3, 4, 5].map(star => (
+          <span
+            key={star}
+            className={star <= rating ? 'filled' : ''}
+            onClick={() => setRating(star)}
+          >
+            ⭐
+          </span>
+        ))}
+      </div>
+
+      {/* 修改原因（當選「不好」或有修改時顯示） */}
+      {isGood === false && (
+        <textarea
+          placeholder="請說明不好的原因，幫助 AI 改進..."
+          value={reason}
+          onChange={e => setReason(e.target.value)}
+        />
+      )}
+
+      <button onClick={handleSubmit}>送出回饋</button>
+    </div>
+  );
+}
+```
+
+### 自動學習機制
+
+#### 方法 1：RAG + 修改歷史（即時參考）
+
+生成草稿時，查詢過去類似問題的回饋：
+
+```python
+# brain/backend/brain/draft_generator.py
+
+async def generate_draft_with_learning(user_message: str, db) -> str:
+    """生成草稿，參考過去的修改經驗"""
+
+    # 1. 搜尋類似問題的歷史回饋
+    similar_feedbacks = await search_similar_feedbacks(user_message, db, limit=5)
+
+    # 2. 篩選有價值的回饋（評分低 + 有修改原因）
+    learning_examples = [
+        f for f in similar_feedbacks
+        if f.rating and f.rating <= 3 and f.feedback_reason
+    ]
+
+    # 3. 組成 Prompt
+    learning_context = ""
+    if learning_examples:
+        learning_context = "\n## 過去類似問題的改進建議：\n"
+        for ex in learning_examples:
+            learning_context += f"- {ex.feedback_reason}\n"
+
+    prompt = f"""你是專業客服助理。
+
+{learning_context}
+
+## 用戶問題：
+{user_message}
+
+請根據上述建議，生成一個高品質的回覆："""
+
+    return await claude.generate(prompt)
+```
+
+#### 方法 2：定期 Prompt 優化（排程執行）
+
+每週分析累積的回饋，自動更新 System Prompt：
+
+```python
+# brain/backend/brain/prompt_optimizer.py
+
+async def analyze_and_optimize_prompt(db):
+    """分析回饋並優化 Prompt"""
+
+    # 1. 取得低評分的回饋
+    low_rated = await db.execute(
+        select(Draft)
+        .where(Draft.rating <= 3, Draft.feedback_reason.isnot(None))
+        .order_by(Draft.feedback_at.desc())
+        .limit(50)
+    )
+    feedbacks = low_rated.scalars().all()
+
+    if len(feedbacks) < 10:
+        return None  # 數據不足
+
+    # 2. 讓 AI 歸納改進規則
+    feedback_text = "\n".join([
+        f"- 原因：{f.feedback_reason}"
+        for f in feedbacks
+    ])
+
+    analysis = await claude.generate(f"""
+分析以下客服草稿的修改原因，歸納出 5 條具體的寫作改進規則：
+
+{feedback_text}
+
+請用以下格式輸出：
+1. [規則一]
+2. [規則二]
+...
+""")
+
+    # 3. 儲存優化後的規則
+    await save_prompt_rules(analysis, db)
+
+    return analysis
+```
+
+#### 方法 3：自動標籤分析
+
+自動為每個回饋加上標籤，便於統計分析：
+
+```python
+IMPROVEMENT_TAGS = [
+    "語氣問題",      # 太生硬、不親切
+    "專業度不足",    # 資訊不正確、不完整
+    "太長/太短",     # 篇幅問題
+    "格式問題",      # 排版、換行
+    "用詞不當",      # 用語太官方、太口語
+    "缺少關鍵資訊",  # 沒回答到重點
+]
+
+async def auto_tag_feedback(feedback_reason: str) -> list[str]:
+    """自動為回饋原因加上標籤"""
+    result = await claude.generate(f"""
+分析以下回饋原因，選擇最相關的標籤（可多選）：
+
+可用標籤：{IMPROVEMENT_TAGS}
+
+回饋原因：{feedback_reason}
+
+只輸出標籤名稱，用逗號分隔：""")
+
+    return [tag.strip() for tag in result.split(",") if tag.strip() in IMPROVEMENT_TAGS]
+```
+
+### Dashboard 顯示
+
+在前端新增「AI 學習進度」頁面：
+
+1. **回饋統計**
+   - 好評率趨勢圖
+   - 平均評分趨勢圖
+   - 本週 vs 上週比較
+
+2. **改進標籤分佈**
+   - 圓餅圖顯示各標籤佔比
+   - 點擊標籤查看具體案例
+
+3. **學習進度**
+   - 目前的 Prompt 規則
+   - 上次優化時間
+   - 手動觸發優化按鈕
+
+### 預期效果
+
+| 指標 | 初期 | 1個月後 | 3個月後 |
+|------|------|---------|---------|
+| 好評率 | 60% | 75% | 85% |
+| 平均評分 | 3.0 | 3.8 | 4.2 |
+| 需人工修改比例 | 50% | 30% | 15% |
+
+---
+
 ## 更新紀錄
 
 - 2025-12-02：建立整合計畫
 - 2025-12-02：新增 AI 費用監控系統規劃
+- 2025-12-02：新增 AI 自我進化系統規劃（回饋收集 + 學習機制）
